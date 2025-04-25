@@ -1,39 +1,106 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-#define SS_PIN 53   // RFID Modülü SPI Chip Select (SDA)
-#define RST_PIN 49  // Reset pini
+// RFID Modülü Pinleri
+#define SS_PIN 53
+#define RST_PIN 49
+MFRC522 rfid(SS_PIN, RST_PIN);
 
-MFRC522 rfid(SS_PIN, RST_PIN);  // RFID modülü için nesne oluştur
+// Pin Tanımları
+const int buttonPin = 3;
+const int pirPin    = 4;
+const int RPWM      = 5;
+const int LPWM      = 6;
+const int REN       = 7;
+const int LEN       = 8;
+
+bool rampOpen = false;
 
 void setup() {
-  Serial.begin(9600);  // Seri haberleşmeyi başlat
-  SPI.begin();         // SPI haberleşmesini başlat
-  rfid.PCD_Init();     // RFID modülünü başlat
-  
-  Serial.println(" RFID Okuyucu Başlatıldı!");
-  Serial.println(" Lütfen bir kart okutun...");
+  Serial.begin(9600);
+  SPI.begin();
+  rfid.PCD_Init();
+
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(pirPin, INPUT);
+  pinMode(RPWM, OUTPUT);
+  pinMode(LPWM, OUTPUT);
+  pinMode(REN, OUTPUT);
+  pinMode(LEN, OUTPUT);
+
+  digitalWrite(REN, HIGH);
+  digitalWrite(LEN, HIGH);
+
+  Serial.println("Sistem Hazır!");
 }
 
 void loop() {
-  // Eğer yeni bir RFID kartı algılanmazsa, döngüyü burada sonlandır
-  if (!rfid.PICC_IsNewCardPresent()) {
-    return;
+  bool pirDetected   = digitalRead(pirPin) == HIGH;
+  bool buttonPressed = digitalRead(buttonPin) == LOW;
+
+  // --- RFID ile yetki kontrolü olmadan açma ---
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    Serial.print("Kart algılandı: ");
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      Serial.print(rfid.uid.uidByte[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+
+    if (!rampOpen) {
+      if (!pirDetected) {
+        openRamp();
+      } else {
+        Serial.println("Engel algılandı! Rampa açılamıyor.");
+      }
+    } else {
+      Serial.println("Rampa zaten açık.");
+    }
+
+    rfid.PICC_HaltA();
   }
 
-  // Eğer karttan UID okunamıyorsa, döngüyü sonlandır
-  if (!rfid.PICC_ReadCardSerial()) {
-    return;
-  }
+  // --- Buton ile açma/kapatma toggle ---
+  if (buttonPressed) {
+    // Debounce için kısa bekleme
+    delay(50);
+    while (digitalRead(buttonPin) == LOW) delay(10);
 
-  // Kart UID’sini Seri Monitör'e yazdır
-  Serial.print(" Kart UID: ");
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    Serial.print(rfid.uid.uidByte[i] < 0x10 ? "0" : " ");  // Tek haneli sayılar için başına 0 ekle
-    Serial.print(rfid.uid.uidByte[i], HEX);  // HEX formatında yazdır
+    if (!rampOpen) {
+      Serial.println("Buton: Açılıyor...");
+      if (!pirDetected) {
+        openRamp();
+      } else {
+        Serial.println("Engel algılandı! Rampa açılamıyor.");
+      }
+    } else {
+      Serial.println("Buton: Kapanıyor...");
+      closeRamp();
+    }
   }
-  Serial.println();
+}
 
-  // Kart okuma işlemi tamamlandı, kartı durdur
-  rfid.PICC_HaltA();
+void openRamp() {
+  Serial.println("Rampa açılıyor...");
+  rampOpen = true;
+  analogWrite(RPWM, 200);
+  analogWrite(LPWM, 0);
+  delay(7000);    // Aktüatör açılma süresi
+  stopRamp();
+  Serial.println("Rampa açık durumda.");
+}
+
+void closeRamp() {
+  Serial.println("Rampa kapanıyor...");
+  analogWrite(RPWM, 0);
+  analogWrite(LPWM, 200);
+  delay(7000);    // Aktüatör kapanma süresi
+  stopRamp();
+  rampOpen = false;
+  Serial.println("Rampa kapandı.");
+}
+
+void stopRamp() {
+  analogWrite(RPWM, 0);
+  analogWrite(LPWM, 0);
 }
