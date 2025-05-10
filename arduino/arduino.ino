@@ -1,20 +1,26 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-// RFID Modulu Pinleri
-#define SS_PIN 53
-#define RST_PIN 49
+// --- RFID Modülü Pinleri ---
+#define SS_PIN   53
+#define RST_PIN  49
 MFRC522 rfid(SS_PIN, RST_PIN);
 
-// Pin Tanimlari
-const int buttonPin = 3;
-const int pirPin    = 4;
-const int RPWM      = 5;
-const int LPWM      = 6;
-const int REN       = 7;
-const int LEN       = 8;
+// --- Pin Tanımları ---
+const int buttonPin       = 3;               // Butonla aç/kapat
+const int pirPin          = 4;               // PIR sensör (isteğe bağlı)
+const int irAnalogPins[4] = {A0, A1, A2, A3}; // IR sensörlerin AO pinleri
+const int RPWM            = 5;               // Motor sağ yönde PWM
+const int LPWM            = 6;               // Motor sol yönde PWM
+const int REN             = 7;               // Motor sürücü enable
+const int LEN             = 8;               // Motor sürücü enable
 
 bool rampOpen = false;
+// Yaklaşık 2 cm için analog eşik (0–1023 arası)
+// Ölçümlerinize göre ~200 civarı değeri test edin
+const int irThreshold = 200;
+// Aktüatör çalışma süresi (ms)
+const unsigned long runDuration = 16000;
 
 void setup() {
   Serial.begin(9600);
@@ -22,23 +28,24 @@ void setup() {
   rfid.PCD_Init();
 
   pinMode(buttonPin, INPUT_PULLUP);
-  pinMode(pirPin, INPUT);
+  pinMode(pirPin,    INPUT);
+  for (int i = 0; i < 4; i++) pinMode(irAnalogPins[i], INPUT);
   pinMode(RPWM, OUTPUT);
   pinMode(LPWM, OUTPUT);
-  pinMode(REN, OUTPUT);
-  pinMode(LEN, OUTPUT);
-
+  pinMode(REN,  OUTPUT);
+  pinMode(LEN,  OUTPUT);
   digitalWrite(REN, HIGH);
   digitalWrite(LEN, HIGH);
 
-  Serial.println("Sistem hazir!");
+  Serial.println("Sistem hazir! IR thresh=200 (~2cm).");
 }
 
 void loop() {
-  bool pirDetected   = digitalRead(pirPin) == HIGH;
-  bool buttonPressed = digitalRead(buttonPin) == LOW;
+  bool pirDetected = (digitalRead(pirPin) == HIGH);
+  bool irDetected  = anyIRDetected();
+  bool obstacle    = pirDetected || irDetected;
 
-  // --- RFID ile rampayi acma ---
+  // RFID ile açma
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     Serial.print("Kart algilandi: ");
     for (byte i = 0; i < rfid.uid.size; i++) {
@@ -48,57 +55,76 @@ void loop() {
     Serial.println();
 
     if (!rampOpen) {
-      if (!pirDetected) {
-        rampaAc();
-      } else {
-        Serial.println("Engel algilandi! Rampa acilamiyor.");
-      }
+      if (!obstacle) rampaAc();
+      else           Serial.println("Engel var, acilmiyor.");
     } else {
       Serial.println("Rampa zaten acik.");
     }
-
-    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
   }
 
-  // --- Buton ile ac/kapat ---
-  if (buttonPressed) {
-    delay(50);  // debounce
+  // Buton ile aç/kapat
+  if (digitalRead(buttonPin) == LOW) {
+    delay(50);
     while (digitalRead(buttonPin) == LOW) delay(10);
 
     if (!rampOpen) {
-      Serial.println("Buton: Rampa aciliyor...");
-      if (!pirDetected) {
-        rampaAc();
-      } else {
-        Serial.println("Engel algilandi! Rampa acilamiyor.");
-      }
+      if (!obstacle) rampaAc();
+      else           Serial.println("Engel var, acilmiyor.");
     } else {
-      Serial.println("Buton: Rampa kapaniyor...");
-      rampaKapat();
+      if (!obstacle) rampaKapat();
+      else           Serial.println("Engel var, kapatılamiyor.");
     }
   }
 }
 
-// Rampa acma islemi (ileri hareket)
+// IR sensörlerinden herhangi biri eşiğin altına inerse true
+bool anyIRDetected() {
+  for (int i = 0; i < 4; i++) {
+    int v = analogRead(irAnalogPins[i]);
+    if (v < irThreshold) return true;
+  }
+  return false;
+}
+
+// Aktüatör kontrolü: süre boyunca her döngüde IR kontrolü yapar
 void rampaAc() {
   Serial.println("Rampa aciliyor...");
   rampOpen = true;
+  unsigned long start = millis();
+  // İleri yönde çalıştır
   analogWrite(RPWM, 0);
   analogWrite(LPWM, 200);
-  delay(16000);  // Aktuator acilma suresi
+
+  while (millis() - start < runDuration) {
+    if (anyIRDetected()) {
+      Serial.println("Engel algilandi! Hareket durduruldu.");
+      break;
+    }
+    // RFID okumaları arkaplanda çalışabilir
+    if (rfid.PICC_IsNewCardPresent()) rfid.PCD_StopCrypto1();
+  }
   motorDur();
-  Serial.println("Rampa acik durumda.");
+  Serial.println("Rampa hareketi sonlandi.");
 }
 
-// Rampa kapatma islemi (geri hareket)
+// Aktüatör geri yönde kontrolü
 void rampaKapat() {
   Serial.println("Rampa kapaniyor...");
+  unsigned long start = millis();
   analogWrite(RPWM, 200);
   analogWrite(LPWM, 0);
-  delay(16000);  // Aktuator kapanma suresi
+
+  while (millis() - start < runDuration) {
+    if (anyIRDetected()) {
+      Serial.println("Engel algilandi! Hareket durduruldu.");
+      break;
+    }
+    if (rfid.PICC_IsNewCardPresent()) rfid.PCD_StopCrypto1();
+  }
   motorDur();
   rampOpen = false;
-  Serial.println("Rampa kapali.");
+  Serial.println("Rampa kapatma sonlandi.");
 }
 
 // Motoru durdur
