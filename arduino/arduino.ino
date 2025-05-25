@@ -39,23 +39,20 @@ unsigned long lastStartStopDebounceTime = 0;
 unsigned long debounceDelay = 50; // ms
 
 // Sistem değişkenleri
-// IMPORTANT: Calibrate this threshold!
-// If LOW IR reading = NO obstacle, and HIGH IR reading = OBSTACLE,
-// set this threshold BETWEEN those typical readings.
-// Example: If no obstacle reads ~50, and obstacle reads ~350, a threshold of 200 might work.
 const int irThreshold = 150; // <<< !!! CALIBRATE THIS VALUE !!!
 const unsigned long runDurationRamp = 2500;
 const unsigned long runDurationStepper = 14000;
 const int motorSpeedRamp = 200;
 const unsigned long obstacleTimeout = 5000;
 const unsigned long rfidReadCooldown = 2000;
-const unsigned long cardProcessingDisplayTime = 1500;
+const unsigned long cardProcessingDisplayTime = 1500; // Used for "Kart Okundu" before "Yetkili Kart" takes over
 const unsigned long invalidCardDisplayTime = 2000;
 
 // --- RFID Yetkilendirme Listesi ---
 String authorizedUids[] = {
   "D32822DA",
   "11223344"
+  // Add your other UIDs here
 };
 const int numAuthorizedUids = sizeof(authorizedUids) / sizeof(authorizedUids[0]);
 // ---------------------------------
@@ -80,6 +77,22 @@ unsigned long lastObstacleTimestamp = 0;
 bool obstacleDetectedCurrent = false;
 unsigned long lastSuccessfulRFIDReadTime = 0;
 String lastReadCardUID = "";
+
+// --- Variables for timer and resume functionality ---
+unsigned long remainingOperationTime = 0;
+SystemState interruptedState = STOPPED;
+volatile bool wasStoppedByObstacle = false;
+// ----------------------------------------------------
+
+// --- Constants and Flags for User-Friendly LCD Messages ---
+const unsigned long YETKILI_KART_DISPLAY_TIME = 2000; // 2 seconds for "Yetkili Kart"
+const unsigned long BRIEF_MESSAGE_DURATION = 2000;    // 2 seconds for "Rampa Acildi/Kapandi"
+
+bool showBriefMessageRampaAcildi = false;
+bool showBriefMessageRampaKapandi = false;
+unsigned long briefMessageDisplayUntil = 0;
+// --------------------------------------------------------
+
 
 void stepperTimerISR() {
   if (motorRunning) {
@@ -129,79 +142,107 @@ void updateLCD() {
   String currentLine1 = "", currentLine2 = "";
   unsigned long now = millis();
 
-  bool isActiveOperationState = (currentState == OPENING_RAMP ||
-                                 currentState == CLOSING_RAMP ||
-                                 currentState == STEPPER_MOVING_FORWARD ||
-                                 currentState == STEPPER_MOVING_BACKWARD ||
-                                 currentState == CARD_READ_PROCESSING);
-
-  if (obstacleDetectedCurrent && isActiveOperationState) {
-    currentLine1 = "Engel Algilandi!";
-    currentLine2 = "Yol Temizleyin";
+  // --- Brief Timed Messages (Priority 1) ---
+  if (showBriefMessageRampaAcildi && now < briefMessageDisplayUntil && !obstacleDetectedCurrent) {
+    currentLine1 = "Rampa Acildi";
+    currentLine2 = "Kullanilabilir";
+  } else if (showBriefMessageRampaKapandi && now < briefMessageDisplayUntil && !obstacleDetectedCurrent) {
+    currentLine1 = "Rampa Kapandi";
+    currentLine2 = "Giris Bekliyor";
   } else {
-    switch (currentState) {
-      case OPENING_RAMP:
-        currentLine1 = "Rampa Aciliyor";
-        currentLine2 = "Lutfen Bekleyin";
-        break;
-      case CLOSING_RAMP:
-        currentLine1 = "Rampa Kapaniyor";
-        currentLine2 = "Stepper Bekliyor";
-        break;
-      case CARD_READ_PROCESSING:
-        currentLine1 = "Kart Okundu";
-        currentLine2 = "Islem Yapiliyor..";
-        break;
-      case INVALID_CARD_DETECTED:
-        if (obstacleDetectedCurrent) {
-          currentLine1 = "Engel Algilandi!";
+    // Reset brief message flags if their time is up or an obstacle appears
+    if (now >= briefMessageDisplayUntil || obstacleDetectedCurrent) {
+        showBriefMessageRampaAcildi = false;
+        showBriefMessageRampaKapandi = false;
+    }
+
+    // --- Obstacle Messages (Priority 2) ---
+    if (obstacleDetectedCurrent) {
+      currentLine1 = "Engel Algilandi!";
+      if (currentState == STOPPED && wasStoppedByObstacle && !obstacleDetectedCurrent) {
+          currentLine2 = "Devam icin Buton"; // Obstacle cleared, waiting for button
+      } else if (currentState == STOPPED && wasStoppedByObstacle && obstacleDetectedCurrent) {
+          currentLine2 = "Yolu Temizleyin";   // Obstacle still there
+      } else if (currentState == INVALID_CARD_DETECTED && obstacleDetectedCurrent) {
           currentLine2 = "Giris Engellendi";
-        } else {
-          currentLine1 = "Gecersiz Kart";
-          currentLine2 = "Lutfen Cikarin";
-        }
-        break;
-      case STEPPER_MOVING_FORWARD:
-        currentLine1 = "Stepper Ileri";
-        currentLine2 = motorRunning ? "Rampa Bekliyor" : "NEMA Durdu (Mnl)";
-        break;
-      case STEPPER_MOVING_BACKWARD:
-        currentLine1 = "Stepper Geri";
-        currentLine2 = motorRunning ? "Islem Suruyor" : "NEMA Durdu (Mnl)";
-        break;
-      case STOPPED:
-        if (obstacleDetectedCurrent) {
-          currentLine1 = "Engel Algilandi!";
-          if (lastObstacleTimestamp > 0 && (now - lastObstacleTimestamp < obstacleTimeout)) {
-            currentLine2 = "Bekleniyor...";
+      } else {
+          currentLine2 = "Yolu Temizleyin";   // General obstacle message
+      }
+    }
+    // --- Resume Indication (Priority 3 - if no obstacle and no brief message) ---
+    else if (currentState == STOPPED && wasStoppedByObstacle && !obstacleDetectedCurrent) {
+      currentLine1 = "Engel Temizlendi";
+      currentLine2 = "Devam icin Buton";
+    }
+    // --- Normal Operation Messages (Priority 4) ---
+    else {
+      switch (currentState) {
+        case CARD_READ_PROCESSING:
+          if (isForwardSequenceInitiatedByRFID && (now - actionStartTimestamp < YETKILI_KART_DISPLAY_TIME)) {
+            currentLine1 = "Yetkili Kart";       // "Authorized Card"
+            currentLine2 = "Islem Basliyor...";  // "Processing Starts..."
           } else {
-            currentLine2 = "Yol Kapali";
+            currentLine1 = "Rampa Aciliyor";    // "Ramp Opening"
+            currentLine2 = "Lutfen Bekleyin";  // "Please Wait"
           }
-        } else if (rampOpen) {
-          currentLine1 = "Rampa Acik";
-          currentLine2 = rampOpenedByRFIDGlobal ? "RFID ile Acildi" : "Dugmeyle Acildi";
-        } else {
-          currentLine1 = "Rampa Kapali";
-          currentLine2 = "Giris Bekliyor";
-        }
-        break;
-      default:
-        currentLine1 = "Sistem Hatasi";
-        currentLine2 = "Yeniden Baslatin";
-        break;
+          break;
+
+        case STEPPER_MOVING_FORWARD: // Fall through
+        case OPENING_RAMP:
+          currentLine1 = "Rampa Aciliyor";      // "Ramp Opening"
+          currentLine2 = wasStoppedByObstacle ? "Devam Ediyor..." : "Lutfen Bekleyin."; // "Resuming..." or "Please Wait."
+          break;
+
+        case CLOSING_RAMP: // Fall through
+        case STEPPER_MOVING_BACKWARD:
+          currentLine1 = "Rampa Kapaniyor";     // "Ramp Closing"
+          currentLine2 = wasStoppedByObstacle ? "Devam Ediyor..." : "Lutfen Bekleyin."; // "Resuming..." or "Please Wait."
+          break;
+
+        case INVALID_CARD_DETECTED:
+          // This is reached if no obstacle caused this state (handled by obstacle check above)
+          currentLine1 = "Gecersiz Kart";       // "Invalid Card"
+          currentLine2 = "Rampa Baslatilamiyor";     // "Please Remove"
+          break;
+
+        case STOPPED:
+          // Default STOPPED messages if no other higher priority message is active
+          if (rampOpen) {
+            currentLine1 = "Rampa Acik";          // "Ramp Open"
+            currentLine2 = "Kullanilabilir";                    // Clear second line
+          } else {
+            currentLine1 = "Rampa Kapali";        // "Ramp Closed"
+            currentLine2 = "Giris Bekliyor";    // "Awaiting Entry"
+          }
+          break;
+
+        default:
+          currentLine1 = "Sistem Hatasi";       // "System Error"
+          currentLine2 = "Yeniden Baslatin";    // "Restart System"
+          break;
+      }
     }
   }
 
+  // Clear brief message flags if an obstacle appears
+  // or if the state changes away from STOPPED (and they were potentially active but interrupted by a new state change).
+  if (obstacleDetectedCurrent || (currentState != STOPPED && (showBriefMessageRampaAcildi || showBriefMessageRampaKapandi))) {
+      showBriefMessageRampaAcildi = false;
+      showBriefMessageRampaKapandi = false;
+  }
+
+  // Actual LCD print logic
   if (currentLine1 != prevLine1 || currentLine2 != prevLine2) {
     lcd.clear();
-    lcd.setCursor(0,0); lcd.print(currentLine1);
-    lcd.setCursor(0,1); lcd.print(currentLine2);
+    lcd.setCursor(0, 0); lcd.print(currentLine1);
+    lcd.setCursor(0, 1); lcd.print(currentLine2);
     prevLine1 = currentLine1;
     prevLine2 = currentLine2;
     Serial.print(F("LCD Update: L1='")); Serial.print(currentLine1);
     Serial.print(F("', L2='")); Serial.print(currentLine2); Serial.println(F("'"));
   }
 }
+
 
 void stopAllMotorsAndGoToStopped(const char* reason) {
   Serial.print(F("SYSTEM_STOP: Reason: ")); Serial.println(reason);
@@ -210,8 +251,9 @@ void stopAllMotorsAndGoToStopped(const char* reason) {
   analogWrite(RPWM, 0);
   analogWrite(LPWM, 0);
   currentState = STOPPED;
-  rampOpenedByRFIDGlobal = false;
-  isForwardSequenceInitiatedByRFID = false;
+  // When stopping due to obstacle or forced stop, clear brief messages
+  showBriefMessageRampaAcildi = false;
+  showBriefMessageRampaKapandi = false;
   Serial.println(F("SYS_STATE: -> STOPPED (All motors off)"));
 }
 
@@ -219,11 +261,10 @@ void setup() {
   Serial.begin(9600);
   while (!Serial);
   Serial.println(F("========================================="));
-  Serial.println(F("Enhanced Ramp + Stepper System V9 Starting..."));
+  Serial.println(F("Enhanced Ramp + Stepper V11 (User LCD) Starting..."));
   Serial.println(F("========================================="));
   Serial.print(F("IR Threshold set to: ")); Serial.println(irThreshold);
   Serial.println(F("Ensure IR sensor is calibrated: Low reading = NO obstacle, High reading = OBSTACLE"));
-
 
   SPI.begin();
   Serial.println(F("- SPI Initialized."));
@@ -243,7 +284,7 @@ void setup() {
   digitalWrite(PUL_PIN, LOW);
   Serial.println(F("- Stepper Motor Pins Initialized (Default Forward)."));
 
-  Timer1.initialize(200);
+  Timer1.initialize(200); 
   Timer1.attachInterrupt(stepperTimerISR);
   Serial.println(F("- Timer1 (Stepper Pulse) Initialized: 200us interval."));
 
@@ -263,7 +304,7 @@ void setup() {
     lcd.clear(); lcd.print(F("RFID HATA!")); lcd.setCursor(0,1); lcd.print(F("Kontrol Edin"));
   }
 
-  updateLCD();
+  updateLCD(); // Initial LCD display
   Serial.println(F("========================================="));
   Serial.println(F("System Ready. Waiting for input..."));
   Serial.println(F("========================================="));
@@ -272,25 +313,46 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  handleStepperButtonsManual(now);
+  handleStepperButtonsManual(now); 
 
   static unsigned long lastIRCheckTime = 0;
   if (now - lastIRCheckTime > 100) {
     int irReading = analogRead(irAnalogPin);
     bool prevObstacleState = obstacleDetectedCurrent;
-    
-    // CORRECTED LOGIC: Obstacle if reading is GREATER than threshold
-    obstacleDetectedCurrent = (irReading > irThreshold); 
+    obstacleDetectedCurrent = (irReading > irThreshold);
 
     if (obstacleDetectedCurrent && !prevObstacleState) {
       lastObstacleTimestamp = now;
       Serial.print(F("IR LOGIC: Obstacle DETECTED. Analog: ")); Serial.print(irReading);
       Serial.print(F(" (Threshold: ")); Serial.print(irThreshold); Serial.println(F(")"));
+      
       bool isActiveMotorOpState = (currentState == OPENING_RAMP ||
                                    currentState == CLOSING_RAMP ||
                                    currentState == STEPPER_MOVING_FORWARD ||
                                    currentState == STEPPER_MOVING_BACKWARD);
-      if (isActiveMotorOpState) {
+      if (isActiveMotorOpState && !wasStoppedByObstacle) { 
+        Serial.print(F("OBSTACLE: Detected during active state: ")); Serial.println(currentState);
+        unsigned long elapsedTime = now - actionStartTimestamp;
+        unsigned long currentOperationFullDuration = 0;
+
+        if (currentState == OPENING_RAMP || currentState == CLOSING_RAMP) {
+            currentOperationFullDuration = runDurationRamp;
+        } else { 
+            currentOperationFullDuration = runDurationStepper;
+        }
+
+        if (elapsedTime < currentOperationFullDuration) {
+            remainingOperationTime = currentOperationFullDuration - elapsedTime;
+        } else {
+            remainingOperationTime = 0; 
+        }
+
+        interruptedState = currentState; 
+        wasStoppedByObstacle = true;     
+        
+        Serial.print(F("OBSTACLE: Stored interrupted state: ")); Serial.println(interruptedState);
+        Serial.print(F("OBSTACLE: Remaining time: ")); Serial.println(remainingOperationTime);
+        
         stopAllMotorsAndGoToStopped("Obstacle Detected During Motor Operation");
       }
     } else if (!obstacleDetectedCurrent && prevObstacleState) {
@@ -303,60 +365,57 @@ void loop() {
   static unsigned long lastIRPeriodicLogTime = 0;
   if (now - lastIRPeriodicLogTime >= 1000) {
     int currentIRReadingForLog = analogRead(irAnalogPin);
-    // CORRECTED LOGIC for periodic log too
-    bool isObstacleForLog = (currentIRReadingForLog > irThreshold); 
-    Serial.print(F("IR STATUS (1s): Value = "));
-    Serial.print(currentIRReadingForLog);
-    if (isObstacleForLog) {
-      Serial.println(F(" - Obstacle DETECTED"));
-    } else {
-      Serial.println(F(" - Path clear"));
-    }
+    bool isObstacleForLog = (currentIRReadingForLog > irThreshold);
+    Serial.print(F("IR STATUS (1s): Value = ")); Serial.print(currentIRReadingForLog);
+    if (isObstacleForLog) Serial.println(F(" - Obstacle DETECTED"));
+    else Serial.println(F(" - Path clear"));
     lastIRPeriodicLogTime = now;
   }
-
-  bool canSystemAutomatedSequencesOperate = !obstacleDetectedCurrent;
-
+  
   static unsigned long lastRFIDResetTime = 0;
-  if (now - lastRFIDResetTime > 60000) {
+  if (now - lastRFIDResetTime > 60000) { 
     Serial.println(F("RFID: Performing periodic PCD_Reset and PCD_Init."));
     rfid.PCD_Reset(); delayMicroseconds(100); rfid.PCD_Init(); rfid.PCD_SetAntennaGain(MFRC522::RxGain_max);
     lastRFIDResetTime = now; Serial.println(F("RFID: Periodic reset complete."));
   }
-
+  
   static unsigned long lastRFIDCheckTime = 0;
-  if ((currentState == STOPPED || currentState == INVALID_CARD_DETECTED) && !rampOpen && (now - lastRFIDCheckTime > 200)) {
-    if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-      String currentCardUID = getUIDString(rfid.uid);
-      Serial.print(F("RFID: New card detected. ")); printUID(rfid.uid);
+  if ((currentState == STOPPED && !wasStoppedByObstacle) || currentState == INVALID_CARD_DETECTED) {
+    if (!rampOpen && (now - lastRFIDCheckTime > 200)) { 
+        if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+            String currentCardUID = getUIDString(rfid.uid);
+            Serial.print(F("RFID: New card detected. ")); printUID(rfid.uid);
 
-      if (now - lastSuccessfulRFIDReadTime < rfidReadCooldown && currentCardUID == lastReadCardUID) {
-        Serial.println(F("RFID: Same card read within cooldown. Ignoring."));
-      } else {
-        lastSuccessfulRFIDReadTime = now;
-        lastReadCardUID = currentCardUID;
+            if (now - lastSuccessfulRFIDReadTime < rfidReadCooldown && currentCardUID == lastReadCardUID) {
+                Serial.println(F("RFID: Same card read within cooldown. Ignoring."));
+            } else {
+                lastSuccessfulRFIDReadTime = now;
+                lastReadCardUID = currentCardUID;
 
-        if (isCardAuthorized(currentCardUID)) {
-          if (canSystemAutomatedSequencesOperate) {
-            Serial.println(F("RFID: Authorized card. Initiating sequence."));
-            isForwardSequenceInitiatedByRFID = true;
-            currentState = CARD_READ_PROCESSING;
-            actionStartTimestamp = now;
-            Serial.println(F("SYS_STATE: -> CARD_READ_PROCESSING (By RFID)"));
-          } else {
-            Serial.println(F("RFID: Authorized card, but OBSTACLE. Operation blocked."));
-            currentState = INVALID_CARD_DETECTED;
-            actionStartTimestamp = now;
-          }
-        } else {
-          Serial.println(F("RFID: Unauthorized card."));
-          currentState = INVALID_CARD_DETECTED;
-          actionStartTimestamp = now;
+                if (isCardAuthorized(currentCardUID)) {
+                    if (!obstacleDetectedCurrent) { 
+                        Serial.println(F("RFID: Authorized card. Initiating sequence."));
+                        isForwardSequenceInitiatedByRFID = true;
+                        currentState = CARD_READ_PROCESSING;
+                        actionStartTimestamp = now; // For YETKILI_KART_DISPLAY_TIME and cardProcessingDisplayTime
+                        wasStoppedByObstacle = false; 
+                        remainingOperationTime = 0;
+                        Serial.println(F("SYS_STATE: -> CARD_READ_PROCESSING (By RFID)"));
+                    } else {
+                        Serial.println(F("RFID: Authorized card, but OBSTACLE. Operation blocked."));
+                        currentState = INVALID_CARD_DETECTED; 
+                        actionStartTimestamp = now;
+                    }
+                } else {
+                    Serial.println(F("RFID: Unauthorized card."));
+                    currentState = INVALID_CARD_DETECTED;
+                    actionStartTimestamp = now;
+                }
+            }
+            rfid.PICC_HaltA(); rfid.PCD_StopCrypto1();
         }
-      }
-      rfid.PICC_HaltA(); rfid.PCD_StopCrypto1();
+        lastRFIDCheckTime = now;
     }
-    lastRFIDCheckTime = now;
   }
 
   static unsigned long lastMainButtonCheckTime = 0;
@@ -365,36 +424,71 @@ void loop() {
     bool currentMainButtonState = digitalRead(buttonPin);
     if (currentMainButtonState == LOW && prevMainButtonState == HIGH) {
       Serial.println(F("MAIN_BTN(10): Pressed."));
+      // Clear any brief messages if button is pressed
+      showBriefMessageRampaAcildi = false;
+      showBriefMessageRampaKapandi = false;
+
       if (currentState == STOPPED) {
-        if (canSystemAutomatedSequencesOperate) {
+        if (wasStoppedByObstacle) { 
+          if (!obstacleDetectedCurrent) {
+            Serial.println(F("MAIN_BTN(10): Resuming operation after obstacle cleared."));
+            currentState = interruptedState; 
+            actionStartTimestamp = now;     
+            
+            if (currentState == STEPPER_MOVING_FORWARD) {
+                motorDirection = true;
+                digitalWrite(DIR_PIN, HIGH);
+                motorRunning = true;
+                 Serial.println(F("RESUME_SETUP: Stepper FORWARD, DIR=HIGH, motorRunning=true"));
+            } else if (currentState == STEPPER_MOVING_BACKWARD) {
+                motorDirection = false;
+                digitalWrite(DIR_PIN, LOW);
+                motorRunning = true;
+                Serial.println(F("RESUME_SETUP: Stepper BACKWARD, DIR=LOW, motorRunning=true"));
+            }
+            Serial.print(F("SYS_STATE: -> RESUMING to ")); Serial.println(currentState);
+            Serial.print(F("Remaining duration: ")); Serial.println(remainingOperationTime);
+          } else {
+            Serial.println(F("MAIN_BTN(10): Obstacle still present. Cannot resume."));
+          }
+        } else if (!obstacleDetectedCurrent) { 
           if (!rampOpen) {
             Serial.println(F("MAIN_BTN(10): Initiating FORWARD sequence."));
             isForwardSequenceInitiatedByRFID = false;
-            // Go to CARD_READ_PROCESSING to unify start, it will then check obstacle again before motor
-            currentState = CARD_READ_PROCESSING; 
-            actionStartTimestamp = now;
+            currentState = CARD_READ_PROCESSING;
+            actionStartTimestamp = now; // For cardProcessingDisplayTime
+            wasStoppedByObstacle = false; remainingOperationTime = 0; interruptedState = STOPPED; 
           } else {
             Serial.println(F("MAIN_BTN(10): Initiating REVERSE sequence."));
             currentState = CLOSING_RAMP;
             actionStartTimestamp = now;
+            wasStoppedByObstacle = false; remainingOperationTime = 0; interruptedState = STOPPED; 
           }
-        } else {
-          Serial.println(F("MAIN_BTN(10): Pressed, but OBSTACLE. Operation blocked."));
-          currentState = INVALID_CARD_DETECTED;
+        } else { 
+          Serial.println(F("MAIN_BTN(10): Pressed, but OBSTACLE. New operation blocked."));
+          currentState = INVALID_CARD_DETECTED; 
           actionStartTimestamp = now;
         }
-      } else {
-         stopAllMotorsAndGoToStopped("Main Button (10) pressed during active/error state");
+      } else { 
+        stopAllMotorsAndGoToStopped("Main Button (10) pressed during active/error state");
+        wasStoppedByObstacle = false; 
+        remainingOperationTime = 0;
+        interruptedState = STOPPED;
+        isForwardSequenceInitiatedByRFID = false;
+        rampOpenedByRFIDGlobal = false;
       }
     }
     prevMainButtonState = currentMainButtonState;
     lastMainButtonCheckTime = now;
   }
 
+
   switch (currentState) {
     case CARD_READ_PROCESSING:
-      if (now - actionStartTimestamp > cardProcessingDisplayTime) {
-        if (!obstacleDetectedCurrent) {
+      // YETKILI_KART_DISPLAY_TIME is handled by updateLCD.
+      // This state duration (cardProcessingDisplayTime) is for the underlying logic before motor starts.
+      if (now - actionStartTimestamp > cardProcessingDisplayTime) { 
+        if (!obstacleDetectedCurrent) { 
             currentState = STEPPER_MOVING_FORWARD;
             actionStartTimestamp = now;
             motorDirection = true;
@@ -403,9 +497,9 @@ void loop() {
             Serial.println(F("SYS_STATE: CARD_READ_PROCESSING -> STEPPER_MOVING_FORWARD"));
             Serial.println(F("STEPPER_CTRL: NEMA motor FORWARD sequence initiated."));
         } else {
-            Serial.println(F("SYS_STATE: CARD_READ_PROCESSING -> OBSTACLE DETECTED. Blocking operation."));
-            currentState = INVALID_CARD_DETECTED;
-            actionStartTimestamp = now;
+            Serial.println(F("SYS_STATE: CARD_READ_PROCESSING -> OBSTACLE DETECTED POST-CHECK. Blocking operation."));
+            currentState = INVALID_CARD_DETECTED; 
+            actionStartTimestamp = now; 
         }
       }
       analogWrite(RPWM, 0); analogWrite(LPWM, 0);
@@ -413,99 +507,150 @@ void loop() {
 
     case INVALID_CARD_DETECTED:
       if (now - actionStartTimestamp > invalidCardDisplayTime) {
-        currentState = STOPPED;
+        currentState = STOPPED; 
         Serial.println(F("SYS_STATE: INVALID_CARD_DETECTED -> STOPPED (Display time elapsed)"));
       }
       analogWrite(RPWM, 0); analogWrite(LPWM, 0);
       break;
 
     case STEPPER_MOVING_FORWARD:
-      if ((now - actionStartTimestamp) >= runDurationStepper) {
-        Serial.println(F("STEPPER_CTRL: NEMA FORWARD time elapsed."));
-        motorRunning = false;
-        digitalWrite(PUL_PIN, LOW);
-        if (!obstacleDetectedCurrent) {
-            currentState = OPENING_RAMP;
-            actionStartTimestamp = now;
-            Serial.print(F("SYS_STATE: STEPPER_MOVING_FORWARD -> OPENING_RAMP (Initiated by "));
-            Serial.println(isForwardSequenceInitiatedByRFID ? F("RFID)") : F("Button)"));
-        } else {
-            Serial.println(F("SYS_STATE: STEPPER_MOVING_FORWARD -> OBSTACLE. Halting."));
-            stopAllMotorsAndGoToStopped("Obstacle after NEMA fwd, before ramp open");
+      { 
+        unsigned long durationToUseStepperFwd = wasStoppedByObstacle ? remainingOperationTime : runDurationStepper;
+        if (!motorRunning && wasStoppedByObstacle) motorRunning = true; 
+
+        if ((now - actionStartTimestamp) >= durationToUseStepperFwd) {
+          Serial.print(F("STEPPER_CTRL: NEMA FORWARD time elapsed. Used duration: ")); Serial.println(durationToUseStepperFwd);
+          motorRunning = false;
+          digitalWrite(PUL_PIN, LOW);
+          
+          if (wasStoppedByObstacle) {
+            Serial.println(F("STEPPER_CTRL: Resumed NEMA FORWARD completed."));
+            wasStoppedByObstacle = false; remainingOperationTime = 0; interruptedState = STOPPED;
+          }
+
+          if (!obstacleDetectedCurrent) {
+              currentState = OPENING_RAMP;
+              actionStartTimestamp = now;
+              Serial.print(F("SYS_STATE: STEPPER_MOVING_FORWARD -> OPENING_RAMP (Initiated by "));
+              Serial.println(isForwardSequenceInitiatedByRFID ? F("RFID)") : F("Button)"));
+          } else {
+              Serial.println(F("SYS_STATE: STEPPER_MOVING_FORWARD -> OBSTACLE. Halting."));
+              stopAllMotorsAndGoToStopped("Obstacle after NEMA fwd, before ramp open");
+          }
         }
       }
       analogWrite(RPWM, 0); analogWrite(LPWM, 0);
       break;
 
     case OPENING_RAMP:
-      if ((now - actionStartTimestamp) < runDurationRamp) {
-        analogWrite(RPWM, motorSpeedRamp); analogWrite(LPWM, 0);
-      } else {
-        Serial.println(F("RAMP_CTRL: Ramp OPENED."));
-        analogWrite(RPWM, 0); analogWrite(LPWM, 0);
-        rampOpen = true;
-        rampOpenedByRFIDGlobal = isForwardSequenceInitiatedByRFID;
-        currentState = STOPPED;
-        Serial.print(F("SYS_STATE: OPENING_RAMP -> STOPPED. Ramp opened by RFID: "));
-        Serial.println(rampOpenedByRFIDGlobal ? F("true") : F("false"));
+      { 
+        unsigned long durationToUseRampOpen = wasStoppedByObstacle ? remainingOperationTime : runDurationRamp;
+        if ((now - actionStartTimestamp) < durationToUseRampOpen) {
+          analogWrite(RPWM, motorSpeedRamp); analogWrite(LPWM, 0);
+        } else {
+          Serial.print(F("RAMP_CTRL: Ramp OPENED. Used duration: ")); Serial.println(durationToUseRampOpen);
+          analogWrite(RPWM, 0); analogWrite(LPWM, 0);
+          rampOpen = true;
+          rampOpenedByRFIDGlobal = isForwardSequenceInitiatedByRFID; 
+          
+          if (wasStoppedByObstacle) {
+            Serial.println(F("RAMP_CTRL: Resumed RAMP OPENING completed."));
+            wasStoppedByObstacle = false; remainingOperationTime = 0; interruptedState = STOPPED;
+          }
+          
+          // ----- SET FLAG FOR LCD BRIEF MESSAGE -----
+          showBriefMessageRampaAcildi = true; 
+          showBriefMessageRampaKapandi = false; 
+          briefMessageDisplayUntil = now + BRIEF_MESSAGE_DURATION;
+          // ----------------------------------------
+          
+          currentState = STOPPED;
+          Serial.print(F("SYS_STATE: OPENING_RAMP -> STOPPED. Ramp opened by RFID: "));
+          Serial.println(rampOpenedByRFIDGlobal ? F("true") : F("false"));
+        }
       }
       break;
 
     case CLOSING_RAMP:
-      if ((now - actionStartTimestamp) < runDurationRamp) {
-        analogWrite(RPWM, 0); analogWrite(LPWM, motorSpeedRamp);
-      } else {
-        Serial.println(F("RAMP_CTRL: Ramp CLOSED."));
-        analogWrite(RPWM, 0); analogWrite(LPWM, 0);
-        rampOpen = false;
-        if (!obstacleDetectedCurrent) {
-            currentState = STEPPER_MOVING_BACKWARD;
-            actionStartTimestamp = now;
-            motorDirection = false;
-            digitalWrite(DIR_PIN, LOW);
-            motorRunning = true;
-            Serial.println(F("SYS_STATE: CLOSING_RAMP -> STEPPER_MOVING_BACKWARD"));
-            Serial.println(F("STEPPER_CTRL: NEMA motor REVERSE sequence initiated."));
+      { 
+        unsigned long durationToUseRampClose = wasStoppedByObstacle ? remainingOperationTime : runDurationRamp;
+        if ((now - actionStartTimestamp) < durationToUseRampClose) {
+          analogWrite(RPWM, 0); analogWrite(LPWM, motorSpeedRamp);
         } else {
-            Serial.println(F("SYS_STATE: CLOSING_RAMP -> OBSTACLE. Halting."));
-            stopAllMotorsAndGoToStopped("Obstacle after ramp close, before NEMA bwd");
+          Serial.print(F("RAMP_CTRL: Ramp CLOSED. Used duration: ")); Serial.println(durationToUseRampClose);
+          analogWrite(RPWM, 0); analogWrite(LPWM, 0);
+          rampOpen = false;
+          
+          if (wasStoppedByObstacle) {
+            Serial.println(F("RAMP_CTRL: Resumed RAMP CLOSING completed."));
+            wasStoppedByObstacle = false; remainingOperationTime = 0; interruptedState = STOPPED;
+          }
+
+          if (!obstacleDetectedCurrent) {
+              currentState = STEPPER_MOVING_BACKWARD;
+              actionStartTimestamp = now;
+              motorDirection = false;
+              digitalWrite(DIR_PIN, LOW);
+              motorRunning = true;
+              Serial.println(F("SYS_STATE: CLOSING_RAMP -> STEPPER_MOVING_BACKWARD"));
+              Serial.println(F("STEPPER_CTRL: NEMA motor REVERSE sequence initiated."));
+          } else {
+              Serial.println(F("SYS_STATE: CLOSING_RAMP -> OBSTACLE. Halting."));
+              stopAllMotorsAndGoToStopped("Obstacle after ramp close, before NEMA bwd");
+          }
         }
       }
       break;
 
     case STEPPER_MOVING_BACKWARD:
-      if ((now - actionStartTimestamp) >= runDurationStepper) {
-        Serial.println(F("STEPPER_CTRL: NEMA REVERSE time elapsed."));
-        motorRunning = false;
-        digitalWrite(PUL_PIN, LOW);
-        currentState = STOPPED;
-        rampOpenedByRFIDGlobal = false;
-        Serial.println(F("SYS_STATE: STEPPER_MOVING_BACKWARD -> STOPPED (Reverse Sequence Complete)"));
+      { 
+        unsigned long durationToUseStepperBwd = wasStoppedByObstacle ? remainingOperationTime : runDurationStepper;
+        if (!motorRunning && wasStoppedByObstacle) motorRunning = true; 
+
+        if ((now - actionStartTimestamp) >= durationToUseStepperBwd) {
+          Serial.print(F("STEPPER_CTRL: NEMA REVERSE time elapsed. Used duration: ")); Serial.println(durationToUseStepperBwd);
+          motorRunning = false;
+          digitalWrite(PUL_PIN, LOW);
+
+          if (wasStoppedByObstacle) {
+            Serial.println(F("STEPPER_CTRL: Resumed NEMA BACKWARD completed."));
+            wasStoppedByObstacle = false; remainingOperationTime = 0; interruptedState = STOPPED;
+          }
+          
+          // ----- SET FLAG FOR LCD BRIEF MESSAGE -----
+          showBriefMessageRampaKapandi = true; 
+          showBriefMessageRampaAcildi = false; 
+          briefMessageDisplayUntil = now + BRIEF_MESSAGE_DURATION;
+          // ----------------------------------------
+
+          currentState = STOPPED;
+          isForwardSequenceInitiatedByRFID = false; 
+          rampOpenedByRFIDGlobal = false; 
+          Serial.println(F("SYS_STATE: STEPPER_MOVING_BACKWARD -> STOPPED (Reverse Sequence Complete)"));
+        }
       }
-      analogWrite(RPWM, 0); analogWrite(LPWM, 0);
+      analogWrite(RPWM, 0); analogWrite(LPWM, 0); 
       break;
 
     case STOPPED:
     default:
-      if (digitalRead(RPWM) != 0 || digitalRead(LPWM) != 0) {
-        analogWrite(RPWM, 0); analogWrite(LPWM, 0);
-      }
       break;
   }
 
   static unsigned long lastLCDUpdateTime = 0;
-  if (now - lastLCDUpdateTime > 250) {
+  if (now - lastLCDUpdateTime > 250) { 
     updateLCD();
     lastLCDUpdateTime = now;
   }
-
+  
   static unsigned long lastStatusReportTime = 0;
-  if (now - lastStatusReportTime > 20000) {
-    Serial.println(F("--- Status Report (20s) ---"));
+  if (now - lastStatusReportTime > 60000) { 
+    Serial.println(F("--- Status Report ---"));
     Serial.print(F("  Timestamp: ")); Serial.println(now);
     Serial.print(F("  System State: "));
     switch(currentState) {
       case STOPPED: Serial.println(F("STOPPED")); break;
+      // ... (rest of status report states)
       case CARD_READ_PROCESSING: Serial.println(F("CARD_READ_PROCESSING")); break;
       case INVALID_CARD_DETECTED: Serial.println(F("INVALID_CARD_DETECTED")); break;
       case STEPPER_MOVING_FORWARD: Serial.println(F("STEPPER_MOVING_FORWARD")); break;
@@ -519,20 +664,28 @@ void loop() {
     if (obstacleDetectedCurrent && lastObstacleTimestamp > 0) {
       Serial.print(F("  Time Since Obstacle First Noted: ")); Serial.print(now - lastObstacleTimestamp); Serial.println(F(" ms"));
     }
-    Serial.print(F("  Can Auto Sequences Operate: ")); Serial.println(canSystemAutomatedSequencesOperate ? "Yes" : "No");
+    Serial.print(F("  Was Stopped By Obstacle: ")); Serial.println(wasStoppedByObstacle ? "Yes" : "No");
+    if(wasStoppedByObstacle){
+      // Serial.print(F("  Interrupted State: ")); Serial.println(interruptedState); // Need a helper to print enum name
+      Serial.print(F("  Remaining Operation Time: ")); Serial.println(remainingOperationTime);
+    }
     Serial.print(F("  NEMA Motor Running: ")); Serial.println(motorRunning ? "Yes" : "No");
     Serial.print(F("  NEMA Motor Direction (true=fwd): ")); Serial.println(motorDirection);
+    Serial.print(F("  BriefMsg Acildi: ")); Serial.print(showBriefMessageRampaAcildi);
+    Serial.print(F(" Kapandi: ")); Serial.print(showBriefMessageRampaKapandi);
+    Serial.print(F(" Until: ")); Serial.println(briefMessageDisplayUntil);
     Serial.println(F("---------------------------"));
     lastStatusReportTime = now;
   }
 }
+
 
 void handleStepperButtonsManual(unsigned long currentTime) {
   static unsigned long lastStepperBtnCheckTime = 0;
   static bool currentDirButtonStateLocal = HIGH;
   static bool currentStartStopStateLocal = HIGH;
 
-  if (currentTime - lastStepperBtnCheckTime < 20) return;
+  if (currentTime - lastStepperBtnCheckTime < 20) return; 
   lastStepperBtnCheckTime = currentTime;
 
   int startStopReading = digitalRead(START_STOP_PIN);
@@ -542,11 +695,11 @@ void handleStepperButtonsManual(unsigned long currentTime) {
   if ((currentTime - lastStartStopDebounceTime) > debounceDelay) {
     if (startStopReading != currentStartStopStateLocal) {
       currentStartStopStateLocal = startStopReading;
-      if (currentStartStopStateLocal == LOW) {
+      if (currentStartStopStateLocal == LOW) { 
         motorRunning = !motorRunning;
         Serial.print(F("MANUAL_STEPPER_BTN(9): NEMA Start/Stop. NEMA Motor Running is now: ")); Serial.println(motorRunning ? "ON" : "OFF");
         if (!motorRunning) {
-          digitalWrite(PUL_PIN, LOW);
+          digitalWrite(PUL_PIN, LOW); 
         }
       }
     }
@@ -560,7 +713,7 @@ void handleStepperButtonsManual(unsigned long currentTime) {
   if ((currentTime - lastDirDebounceTime) > debounceDelay) {
     if (dirReading != currentDirButtonStateLocal) {
       currentDirButtonStateLocal = dirReading;
-      if (currentDirButtonStateLocal == LOW) {
+      if (currentDirButtonStateLocal == LOW) { 
         motorDirection = !motorDirection;
         digitalWrite(DIR_PIN, motorDirection ? HIGH : LOW);
         Serial.print(F("MANUAL_STEPPER_BTN(3): NEMA Direction Changed. NEMA Dir is now: ")); Serial.println(motorDirection ? "FWD (DIR_PIN=HIGH)" : "BWD (DIR_PIN=LOW)");
