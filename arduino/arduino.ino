@@ -26,6 +26,10 @@ const int LEN = 8;
 #define DIR_BUTTON_PIN 3
 #define START_STOP_PIN 9
 
+// YENİ EKLENEN: Lineer Aktüatör (Rampa) Manuel Kontrol Pinleri
+const int rampDirButtonPin = 11;         // Lineer Aktüatör (Rampa) Yön Butonu
+const int rampStartStopButtonPin = 12;   // Lineer Aktüatör (Rampa) Başlat/Durdur Butonu
+
 // Stepper motor değişkenleri - interrupt için volatile
 volatile bool motorDirection = true;
 volatile bool motorRunning = false;
@@ -37,6 +41,17 @@ unsigned long lastDirDebounceTime = 0;
 bool lastStartStopState = HIGH;
 unsigned long lastStartStopDebounceTime = 0;
 unsigned long debounceDelay = 50; // ms
+
+// YENİ EKLENEN: Ramp manual control button state tracking (for debouncing) - Rampa manuel kontrol buton durum takibi (parazit önleme için)
+bool lastRampDirButtonState_manual = HIGH;
+unsigned long lastRampDirDebounceTime_manual = 0;
+bool lastRampStartStopButtonState_manual = HIGH;
+unsigned long lastRampStartStopDebounceTime_manual = 0;
+
+// YENİ EKLENEN: Ramp manual control motor state variables - Rampa manuel kontrol motor durum değişkenleri
+bool ramp_manualMotorRunning = false;             // Rampa motoru manuel olarak çalışıyor mu?
+bool ramp_manualDirectionForward = true;          // Rampa manuel yönü: true = İLERİ (Açma), false = GERİ (Kapama)
+
 
 // Sistem değişkenleri
 const int irThreshold = 150; // <<< !!! CALIBRATE THIS VALUE !!!
@@ -179,8 +194,8 @@ void updateLCD() {
       switch (currentState) {
         case CARD_READ_PROCESSING:
           if (isForwardSequenceInitiatedByRFID && (now - actionStartTimestamp < YETKILI_KART_DISPLAY_TIME)) {
-            currentLine1 = "Yetkili Kart";       // "Authorized Card"
-            currentLine2 = "Islem Basliyor...";  // "Processing Starts..."
+            currentLine1 = "Yetkili Kart";      // "Authorized Card"
+            currentLine2 = "Islem Basliyor..."; // "Processing Starts..."
           } else {
             currentLine1 = "Rampa Aciliyor";    // "Ramp Opening"
             currentLine2 = "Lutfen Bekleyin";  // "Please Wait"
@@ -202,14 +217,18 @@ void updateLCD() {
         case INVALID_CARD_DETECTED:
           // This is reached if no obstacle caused this state (handled by obstacle check above)
           currentLine1 = "Gecersiz Kart";       // "Invalid Card"
-          currentLine2 = "Rampa Baslatilamiyor";     // "Please Remove"
+          currentLine2 = "Rampa Baslatilamiyor";     // "Please Remove" / "Cannot Start Ramp"
           break;
 
         case STOPPED:
           // Default STOPPED messages if no other higher priority message is active
-          if (rampOpen) {
+          // Also, do not show default STOPPED if manual ramp control is active
+          if (ramp_manualMotorRunning) {
+             currentLine1 = "Manuel Rampa";
+             currentLine2 = ramp_manualDirectionForward ? "Aciliyor..." : "Kapaniyor...";
+          } else if (rampOpen) {
             currentLine1 = "Rampa Acik";          // "Ramp Open"
-            currentLine2 = "Kullanilabilir";                    // Clear second line
+            currentLine2 = "Kullanilabilir";                 // Clear second line
           } else {
             currentLine1 = "Rampa Kapali";        // "Ramp Closed"
             currentLine2 = "Giris Bekliyor";    // "Awaiting Entry"
@@ -250,6 +269,11 @@ void stopAllMotorsAndGoToStopped(const char* reason) {
   digitalWrite(PUL_PIN, LOW);
   analogWrite(RPWM, 0);
   analogWrite(LPWM, 0);
+  // If manual ramp motor was running, ensure it's marked as stopped too
+  if (ramp_manualMotorRunning) {
+    ramp_manualMotorRunning = false;
+    Serial.println(F("MANUAL_RAMP_CTRL: Stopped due to stopAllMotorsAndGoToStopped call."));
+  }
   currentState = STOPPED;
   // When stopping due to obstacle or forced stop, clear brief messages
   showBriefMessageRampaAcildi = false;
@@ -261,7 +285,7 @@ void setup() {
   Serial.begin(9600);
   while (!Serial);
   Serial.println(F("========================================="));
-  Serial.println(F("Enhanced Ramp + Stepper V11 (User LCD) Starting..."));
+  Serial.println(F("Enhanced Ramp + Stepper V11 (User LCD + Manual Ramp) Starting..."));
   Serial.println(F("========================================="));
   Serial.print(F("IR Threshold set to: ")); Serial.println(irThreshold);
   Serial.println(F("Ensure IR sensor is calibrated: Low reading = NO obstacle, High reading = OBSTACLE"));
@@ -275,6 +299,11 @@ void setup() {
   pinMode(REN,  OUTPUT); pinMode(LEN,  OUTPUT);
   digitalWrite(REN, HIGH); digitalWrite(LEN, HIGH);
   Serial.println(F("- DC Motor (Ramp) & IR Sensor Pins Initialized."));
+
+  // YENİ EKLENEN: Lineer Aktüatör (Rampa) Manuel Kontrol Pinleri
+  pinMode(rampDirButtonPin, INPUT_PULLUP);
+  pinMode(rampStartStopButtonPin, INPUT_PULLUP);
+  Serial.println(F("- Linear Actuator (Ramp) Manual Control Pins Initialized (Pins 11, 12)."));
 
   pinMode(DIR_PIN, OUTPUT); pinMode(PUL_PIN, OUTPUT);
   pinMode(DIR_BUTTON_PIN, INPUT_PULLUP);
@@ -310,10 +339,137 @@ void setup() {
   Serial.println(F("========================================="));
 }
 
+void handleStepperButtonsManual(unsigned long currentTime) {
+  static unsigned long lastStepperBtnCheckTime = 0;
+  static bool currentDirButtonStateLocal = HIGH;
+  static bool currentStartStopStateLocal = HIGH;
+
+  if (currentTime - lastStepperBtnCheckTime < 20) return; 
+  lastStepperBtnCheckTime = currentTime;
+
+  int startStopReading = digitalRead(START_STOP_PIN);
+  if (startStopReading != lastStartStopState) {
+    lastStartStopDebounceTime = currentTime;
+  }
+  if ((currentTime - lastStartStopDebounceTime) > debounceDelay) {
+    if (startStopReading != currentStartStopStateLocal) {
+      currentStartStopStateLocal = startStopReading;
+      if (currentStartStopStateLocal == LOW) { 
+        motorRunning = !motorRunning;
+        Serial.print(F("MANUAL_STEPPER_BTN(9): NEMA Start/Stop. NEMA Motor Running is now: ")); Serial.println(motorRunning ? "ON" : "OFF");
+        if (!motorRunning) {
+          digitalWrite(PUL_PIN, LOW); 
+        }
+      }
+    }
+  }
+  lastStartStopState = startStopReading;
+
+  int dirReading = digitalRead(DIR_BUTTON_PIN);
+  if (dirReading != lastDirButtonState) {
+    lastDirDebounceTime = currentTime;
+  }
+  if ((currentTime - lastDirDebounceTime) > debounceDelay) {
+    if (dirReading != currentDirButtonStateLocal) {
+      currentDirButtonStateLocal = dirReading;
+      if (currentDirButtonStateLocal == LOW) { 
+        motorDirection = !motorDirection;
+        digitalWrite(DIR_PIN, motorDirection ? HIGH : LOW);
+        Serial.print(F("MANUAL_STEPPER_BTN(3): NEMA Direction Changed. NEMA Dir is now: ")); Serial.println(motorDirection ? "FWD (DIR_PIN=HIGH)" : "BWD (DIR_PIN=LOW)");
+      }
+    }
+  }
+  lastDirButtonState = dirReading;
+}
+
+// YENİ EKLENEN FONKSİYON: Rampa motoru için manuel kontrol
+void handleRampButtonsManual(unsigned long currentTime) {
+    static unsigned long lastRampBtnCheckTime_local = 0; // Yerel yoklama zamanlayıcı değişkeni için farklı bir isim
+    static bool currentRampDirButtonState_local = HIGH;    // Butonun mantıksal (parazitten arındırılmış) durumu
+    static bool currentRampStartStopState_local = HIGH;  // Butonun mantıksal (parazitten arındırılmış) durumu
+
+    // Butonları çok sık kontrol etmemek için (20ms aralık)
+    if (currentTime - lastRampBtnCheckTime_local < 20) return;
+    lastRampBtnCheckTime_local = currentTime;
+
+    // Çok önemli: Manuel rampa kontrolü sadece sistem 'STOPPED' durumundaysa ve
+    // bir engel nedeniyle durmamışsa veya ana sistem tarafından aktif bir işlemde değilse çalışır.
+    if (currentState != STOPPED || wasStoppedByObstacle) {
+        if (ramp_manualMotorRunning) { // Eğer manuel çalışıyorken sistem durumu değişirse motoru durdur
+            analogWrite(RPWM, 0);
+            analogWrite(LPWM, 0);
+            ramp_manualMotorRunning = false; // Durdu olarak işaretle
+            Serial.println(F("MANUAL_RAMP_CTRL: Sistem STOPPED durumundan çıktığı veya engel olduğu için otomatik durduruldu."));
+        }
+        return; // Sistem meşgulse veya uygun durumda değilse fonksiyondan çık
+    }
+
+    // Rampa Başlat/Durdur Butonu Mantığı (Pin 12)
+    int startStopReading = digitalRead(rampStartStopButtonPin);
+    if (startStopReading != lastRampStartStopButtonState_manual) { // Ham durum değiştiyse parazit önleme zamanlayıcısını sıfırla
+        lastRampStartStopDebounceTime_manual = currentTime;
+    }
+    if ((currentTime - lastRampStartStopDebounceTime_manual) > debounceDelay) {
+        // Parazit önleme süresi geçtikten sonra, mantıksal durumun değişip değişmediğini kontrol et
+        if (startStopReading != currentRampStartStopState_local) {
+            currentRampStartStopState_local = startStopReading; // Mantıksal durumu güncelle
+            if (currentRampStartStopState_local == LOW) { // Butona basıldı (LOW)
+                ramp_manualMotorRunning = !ramp_manualMotorRunning; // Motorun çalışma durumunu tersine çevir
+                Serial.print(F("MANUAL_RAMP_BTN(12): Baslat/Durdur. Rampa Manuel Motor Calismasi: "));
+                Serial.println(ramp_manualMotorRunning ? F("ACIK") : F("KAPALI"));
+
+                if (ramp_manualMotorRunning) {
+                    if (ramp_manualDirectionForward) { // Yöne göre motoru sür
+                        analogWrite(RPWM, motorSpeedRamp);
+                        analogWrite(LPWM, 0);
+                        Serial.println(F("MANUAL_RAMP_CTRL: ILERI hareket (Aciliyor)"));
+                    } else {
+                        analogWrite(RPWM, 0);
+                        analogWrite(LPWM, motorSpeedRamp);
+                        Serial.println(F("MANUAL_RAMP_CTRL: GERI hareket (Kapaniyor)"));
+                    }
+                } else { // Motor durduruluyorsa
+                    analogWrite(RPWM, 0);
+                    analogWrite(LPWM, 0);
+                    Serial.println(F("MANUAL_RAMP_CTRL: Durduruldu."));
+                    // NOT: Manuel operasyon 'rampOpen' bayrağını DEĞİŞTİRMEZ.
+                    // Bu, NEMA manuel kontrolüne benzer şekilde, sistemin genel durumunu etkilememesi içindir.
+                }
+            }
+        }
+    }
+    lastRampStartStopButtonState_manual = startStopReading; // Bir sonraki döngü için ham durumu sakla
+
+    // Rampa Yön Butonu Mantığı (Pin 11)
+    int dirReading = digitalRead(rampDirButtonPin);
+    if (dirReading != lastRampDirButtonState_manual) { // Ham durum değiştiyse parazit önleme zamanlayıcısını sıfırla
+        lastRampDirDebounceTime_manual = currentTime;
+    }
+    if ((currentTime - lastRampDirDebounceTime_manual) > debounceDelay) {
+        // Parazit önleme süresi geçtikten sonra, mantıksal durumun değişip değişmediğini kontrol et
+        if (dirReading != currentRampDirButtonState_local) {
+            currentRampDirButtonState_local = dirReading; // Mantıksal durumu güncelle
+            if (currentRampDirButtonState_local == LOW) { // Butona basıldı (LOW)
+                // ÖNEMLİ: Yönü sadece motor manuel olarak çalışmıyorken değiştir
+                if (!ramp_manualMotorRunning) {
+                    ramp_manualDirectionForward = !ramp_manualDirectionForward; // Yönü tersine çevir
+                    Serial.print(F("MANUAL_RAMP_BTN(11): Yon Degistirildi. Rampa Manuel Yonu: "));
+                    Serial.println(ramp_manualDirectionForward ? F("ILERI (Acma)") : F("GERI (Kapama)"));
+                } else {
+                    Serial.println(F("MANUAL_RAMP_BTN(11): Rampa motoru manuel calisirken yon degistirilemez. Once motoru durdurun."));
+                }
+            }
+        }
+    }
+    lastRampDirButtonState_manual = dirReading; // Bir sonraki döngü için ham durumu sakla
+}
+
+
 void loop() {
   unsigned long now = millis();
 
-  handleStepperButtonsManual(now); 
+  handleStepperButtonsManual(now);
+  handleRampButtonsManual(now); // YENİ EKLENEN ÇAĞRI: Rampa manuel kontrolünü işle
 
   static unsigned long lastIRCheckTime = 0;
   if (now - lastIRCheckTime > 100) {
@@ -348,7 +504,7 @@ void loop() {
         }
 
         interruptedState = currentState; 
-        wasStoppedByObstacle = true;     
+        wasStoppedByObstacle = true;      
         
         Serial.print(F("OBSTACLE: Stored interrupted state: ")); Serial.println(interruptedState);
         Serial.print(F("OBSTACLE: Remaining time: ")); Serial.println(remainingOperationTime);
@@ -380,7 +536,9 @@ void loop() {
   }
   
   static unsigned long lastRFIDCheckTime = 0;
-  if ((currentState == STOPPED && !wasStoppedByObstacle) || currentState == INVALID_CARD_DETECTED) {
+  // RFID okuması sadece sistem 'STOPPED' durumundaysa, engel tarafından durdurulmamışsa
+  // ve manuel rampa kontrolü aktif değilse yapılmalı.
+  if (currentState == STOPPED && !wasStoppedByObstacle && !ramp_manualMotorRunning) {
     if (!rampOpen && (now - lastRFIDCheckTime > 200)) { 
         if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
             String currentCardUID = getUIDString(rfid.uid);
@@ -422,18 +580,27 @@ void loop() {
   static bool prevMainButtonState = HIGH;
   if (now - lastMainButtonCheckTime > 50) {
     bool currentMainButtonState = digitalRead(buttonPin);
-    if (currentMainButtonState == LOW && prevMainButtonState == HIGH) {
+    if (currentMainButtonState == LOW && prevMainButtonState == HIGH) { // Buton basıldı
       Serial.println(F("MAIN_BTN(10): Pressed."));
       // Clear any brief messages if button is pressed
       showBriefMessageRampaAcildi = false;
       showBriefMessageRampaKapandi = false;
 
-      if (currentState == STOPPED) {
+      // Eğer manuel rampa kontrolü aktifse, ana buton onu durdurup sistemi normale döndürsün.
+      if (ramp_manualMotorRunning) {
+          ramp_manualMotorRunning = false;
+          analogWrite(RPWM, 0);
+          analogWrite(LPWM, 0);
+          Serial.println(F("MANUAL_RAMP_CTRL: Main button pressed, manual ramp control stopped."));
+          // currentState zaten STOPPED olmalı, bu yüzden tekrar set etmeye gerek yok.
+          // Diğer flag'leri (wasStoppedByObstacle vb.) burada resetlemeye gerek yok,
+          // çünkü manuel mod zaten bu flag'ler uygunsa çalışır.
+      } else if (currentState == STOPPED) {
         if (wasStoppedByObstacle) { 
           if (!obstacleDetectedCurrent) {
             Serial.println(F("MAIN_BTN(10): Resuming operation after obstacle cleared."));
             currentState = interruptedState; 
-            actionStartTimestamp = now;     
+            actionStartTimestamp = now;      
             
             if (currentState == STEPPER_MOVING_FORWARD) {
                 motorDirection = true;
@@ -469,7 +636,7 @@ void loop() {
           currentState = INVALID_CARD_DETECTED; 
           actionStartTimestamp = now;
         }
-      } else { 
+      } else { // Sistem STOPPED değilse (aktif bir işlemde veya hata durumunda)
         stopAllMotorsAndGoToStopped("Main Button (10) pressed during active/error state");
         wasStoppedByObstacle = false; 
         remainingOperationTime = 0;
@@ -633,6 +800,14 @@ void loop() {
       break;
 
     case STOPPED:
+      // Eğer manuel rampa kontrolü aktif değilse, normalde motorlar duruk olmalı.
+      // Manuel kontrol kendi motor çıkışlarını yönetir.
+      if (!ramp_manualMotorRunning) {
+        analogWrite(RPWM, 0); 
+        analogWrite(LPWM, 0);
+      }
+      // Diğer motorlar (NEMA) zaten STOPPED durumunda durmuş olmalı.
+      break;
     default:
       break;
   }
@@ -650,7 +825,6 @@ void loop() {
     Serial.print(F("  System State: "));
     switch(currentState) {
       case STOPPED: Serial.println(F("STOPPED")); break;
-      // ... (rest of status report states)
       case CARD_READ_PROCESSING: Serial.println(F("CARD_READ_PROCESSING")); break;
       case INVALID_CARD_DETECTED: Serial.println(F("INVALID_CARD_DETECTED")); break;
       case STEPPER_MOVING_FORWARD: Serial.println(F("STEPPER_MOVING_FORWARD")); break;
@@ -669,56 +843,14 @@ void loop() {
       // Serial.print(F("  Interrupted State: ")); Serial.println(interruptedState); // Need a helper to print enum name
       Serial.print(F("  Remaining Operation Time: ")); Serial.println(remainingOperationTime);
     }
-    Serial.print(F("  NEMA Motor Running: ")); Serial.println(motorRunning ? "Yes" : "No");
+    Serial.print(F("  NEMA Motor Running (Auto): ")); Serial.println(motorRunning ? "Yes" : "No"); // Clarify this is auto NEMA
     Serial.print(F("  NEMA Motor Direction (true=fwd): ")); Serial.println(motorDirection);
+    Serial.print(F("  Manual Ramp Motor Running: ")); Serial.println(ramp_manualMotorRunning ? "Yes" : "No");
+    Serial.print(F("  Manual Ramp Direction (true=fwd/open): ")); Serial.println(ramp_manualDirectionForward);
     Serial.print(F("  BriefMsg Acildi: ")); Serial.print(showBriefMessageRampaAcildi);
     Serial.print(F(" Kapandi: ")); Serial.print(showBriefMessageRampaKapandi);
     Serial.print(F(" Until: ")); Serial.println(briefMessageDisplayUntil);
     Serial.println(F("---------------------------"));
     lastStatusReportTime = now;
   }
-}
-
-
-void handleStepperButtonsManual(unsigned long currentTime) {
-  static unsigned long lastStepperBtnCheckTime = 0;
-  static bool currentDirButtonStateLocal = HIGH;
-  static bool currentStartStopStateLocal = HIGH;
-
-  if (currentTime - lastStepperBtnCheckTime < 20) return; 
-  lastStepperBtnCheckTime = currentTime;
-
-  int startStopReading = digitalRead(START_STOP_PIN);
-  if (startStopReading != lastStartStopState) {
-    lastStartStopDebounceTime = currentTime;
-  }
-  if ((currentTime - lastStartStopDebounceTime) > debounceDelay) {
-    if (startStopReading != currentStartStopStateLocal) {
-      currentStartStopStateLocal = startStopReading;
-      if (currentStartStopStateLocal == LOW) { 
-        motorRunning = !motorRunning;
-        Serial.print(F("MANUAL_STEPPER_BTN(9): NEMA Start/Stop. NEMA Motor Running is now: ")); Serial.println(motorRunning ? "ON" : "OFF");
-        if (!motorRunning) {
-          digitalWrite(PUL_PIN, LOW); 
-        }
-      }
-    }
-  }
-  lastStartStopState = startStopReading;
-
-  int dirReading = digitalRead(DIR_BUTTON_PIN);
-  if (dirReading != lastDirButtonState) {
-    lastDirDebounceTime = currentTime;
-  }
-  if ((currentTime - lastDirDebounceTime) > debounceDelay) {
-    if (dirReading != currentDirButtonStateLocal) {
-      currentDirButtonStateLocal = dirReading;
-      if (currentDirButtonStateLocal == LOW) { 
-        motorDirection = !motorDirection;
-        digitalWrite(DIR_PIN, motorDirection ? HIGH : LOW);
-        Serial.print(F("MANUAL_STEPPER_BTN(3): NEMA Direction Changed. NEMA Dir is now: ")); Serial.println(motorDirection ? "FWD (DIR_PIN=HIGH)" : "BWD (DIR_PIN=LOW)");
-      }
-    }
-  }
-  lastDirButtonState = dirReading;
 }
